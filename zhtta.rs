@@ -126,11 +126,11 @@ impl WebServer {
             let mut acceptor = listener.listen().unwrap();
             println!("{} listening on {} (serving from: {}).", 
                      SERVER_NAME, addr, www_dir_path_str.as_str().unwrap());
-            for stream_raw in acceptor.incoming() {
-                let (queue_tx, queue_rx) = channel();
-                queue_tx.send(request_queue_arc.clone());
+            for stream_raw in acceptor.incoming() { //for each stream/connection
+                let (queue_tx, queue_rx) = channel();//build up a channel for sub thread
+                queue_tx.send(request_queue_arc.clone());//send the request queue to channel
                 
-                let notify_chan = notify_tx.clone();
+                let notify_chan = notify_tx.clone();//notify_chan is a global channel for webserver 
                 let stream_map_arc = stream_map_arc.clone();
                 let visitor_count=visitor_count.clone();
                 println!("outer thread:{}",*visitor_count.lock().unwrap());
@@ -139,7 +139,7 @@ impl WebServer {
                     let mut vc= visitor_count.lock().unwrap();  // Done
                     *vc+=1;
                     println!("inner thread:{}",*vc);
-                    let request_queue_arc = queue_rx.recv().unwrap();
+                    let request_queue_arc = queue_rx.recv().unwrap();//
                     let mut stream = match stream_raw {
                         Ok(s) => {s}
 				        Err(e) => { panic!("Error getting the listener stream! {}", e) }

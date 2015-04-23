@@ -1,13 +1,3 @@
-PA3
-===
-
-Starting code for Programming Assignment 3 of cs146a
-
-Includes:
-
-- zhtta.rs: starting code for Zhtta web server.
-
-- zhtta-test.txt: list of test URLs
-
-- www/index.shtml: a simple test file
-
+This is a rust server which contain gash terminal which is implement by myself.
+1. It support serving dynamic html file which is marked as shtml.
+2. Using safe synchronization mechanism.
