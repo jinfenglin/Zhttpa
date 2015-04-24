@@ -221,6 +221,7 @@ impl WebServer {
         
         let mut cache_str=String::new();
         let mut counter=0;
+        debug!("waiting for caching mutex");
         let mut local_cache=cache.lock().unwrap();
         //if the file is modified, remove the cache
         
@@ -231,8 +232,11 @@ impl WebServer {
         }
         if local_cache.contains_key(path){
             debug!("Reading cached file:{}",path.display());
-            let pair=local_cache.get(path).unwrap();
-            let _ = stream.write(pair.0.as_bytes());
+            let mut pair=local_cache.get_mut(path).unwrap();
+            pair.1=0;
+            //String::form_str("hello");
+            stream.write(HTTP_OK.as_bytes());
+            let _ = stream.write_all(pair.0.as_bytes());
         }
         else{
             debug!("reading from disk!");
@@ -245,7 +249,7 @@ impl WebServer {
                 }
                 local_cache.insert(path.clone(),(cache_str,0));
                 let cp_local_cache= local_cache.clone();
-                if cp_local_cache.len()>1{
+                if cp_local_cache.len()>2{
                     let mut max_num=0;
                     let mut to_be_replaced : &Path=&Path::new("./");
                     for (key,value) in cp_local_cache.iter(){
@@ -377,6 +381,7 @@ impl WebServer {
             let sema=self.thread_sema.clone();
             let cache=self.cache.clone();
             Thread::spawn(move||{
+                debug!("Processing....");
                 WebServer::respond_with_static_file(stream, &request.path,cache);
                 debug!("finishing request for{}",request.path.display());
                 debug!("=====Terminated connection from [{}].=====", request.peer_name);
