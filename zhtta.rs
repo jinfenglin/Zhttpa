@@ -31,6 +31,7 @@ extern crate libc;
 
 use std::io::*;
 use std::old_io::File;
+use std::sync::Semaphore;
 use std::{os, str};
 use std::process::{Command, Stdio};
 use std::old_path::posix::Path;
@@ -58,7 +59,7 @@ static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; cha
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
 
 static COUNTER_STYLE : &'static str = "<doctype !html><html><head><title>Hello, Rust!</title>
-             <style>body { background-image: url('galaxy.jpg');background-color: #884414; color: #FFEEAA}
+             <style>body {background-color: #884414; color: #FFEEAA}
                     h1 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm red }
                     h2 { font-size:2cm; text-align: center; color: black; text-shadow: 0 0 4mm green }
              </style></head>
@@ -81,8 +82,10 @@ struct WebServer {
     www_dir_path: Path,
     
     request_queue_arc: Arc<Mutex<Vec<HTTP_Request>>>,
-    stream_map_arc: Arc<Mutex<HashMap<String, std::old_io::net::tcp::TcpStream>>>,
+    stream_map_arc: Arc<Mutex<HashMap<String, std::old_io::net::tcp::TcpStream>>>,//it is a hash map,store the http stream for each ip
     visitor_count : Arc<Mutex<usize>>,
+    thread_sema : Arc<Semaphore>,
+    cache: Arc<Mutex<HashMap<Path,String>>>,
 
     
     notify_rx: Receiver<()>,
@@ -103,6 +106,8 @@ impl WebServer {
             request_queue_arc: Arc::new(Mutex::new(Vec::new())),
             stream_map_arc: Arc::new(Mutex::new(HashMap::new())),
             visitor_count:Arc::new(Mutex::new(0)),
+            thread_sema: Arc::new(Semaphore::new(5)),
+            cache: Arc::new(Mutex::new(HashMap::new())),
             
             notify_rx: notify_rx,
             notify_tx: notify_tx,
@@ -128,7 +133,7 @@ impl WebServer {
                      SERVER_NAME, addr, www_dir_path_str.as_str().unwrap());
             for stream_raw in acceptor.incoming() { //for each stream/connection
                 let (queue_tx, queue_rx) = channel();//build up a channel for sub thread
-                queue_tx.send(request_queue_arc.clone());//send the request queue to channel
+                queue_tx.send(request_queue_arc.clone());//send the request queue to queue and receive it inside the son thread
                 
                 let notify_chan = notify_tx.clone();//notify_chan is a global channel for webserver 
                 let stream_map_arc = stream_map_arc.clone();
@@ -210,14 +215,24 @@ impl WebServer {
     
     // TODO: Streaming file.
     // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path) {
-			let mut stream = stream;
-      let file_reader = File::open(path).unwrap();
-      stream.write(HTTP_OK.as_bytes());
-      let mut reader = BufferedReader::new(file_reader);
-			for line in reader.lines().filter_map(|result| result.ok()) {
-				let _ = stream.write_all(line.as_bytes());
-			}
+    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<Mutex<HashMap<Path,String>>>) {
+        let mut stream = stream;
+        let content= match cache.lock().unwrap().get(path){
+            Some(f) => 
+            {
+                debug!("Reading cached file:{}",path.display());
+                let _ = stream.write_all(f.as_bytes());
+            },
+            None    => {
+                debug!("reading from disk!");
+                let file_reader = File::open(path).unwrap();
+                stream.write(HTTP_OK.as_bytes());
+                let mut reader = BufferedReader::new(file_reader);
+                //cache.lock().unwrap().insert(path.clone(),String::new());
+                for line in reader.lines().filter_map(|result| result.ok()) {
+                    let _ = stream.write_all(line.as_bytes());
+                }
+            }};            
     }
     
     // TODO: Server-side gashing.
@@ -254,7 +269,11 @@ impl WebServer {
         stream.write(cmd_mix[1].as_bytes());
       //WebServer::respond_with_static_file(stream, path);
     }
-    
+    fn get_file_size(path: &Path) ->u64 {
+        let metadata=std::fs::metadata(path).unwrap();
+        return metadata.len()
+        
+    }
     // TODO: Smarter Scheduling.
     fn enqueue_static_file_request(stream: std::old_io::net::tcp::TcpStream, path_obj: &Path, stream_map_arc: Arc<Mutex<HashMap<String, std::old_io::net::tcp::TcpStream>>>, req_queue_arc: Arc<Mutex<Vec<HTTP_Request>>>, notify_chan: Sender<()>) {
     	// Save stream in hashmap for later response.
@@ -287,7 +306,13 @@ impl WebServer {
                 Ok(s) => s,
                 Err(e) => panic!("There was an error while receiving from the request channel! {}", e),
             };
+            //REORDER the queue in order of the request size
             local_req_queue.push(req);
+            local_req_queue.sort_by(|a, b| WebServer::get_file_size(&a.path).cmp(&WebServer::get_file_size(&b.path)));
+            /*for request in local_req_queue.iter(){
+                println!("current req order:{}",request.path.display());
+            }*/
+            
             debug!("A new request enqueued, now the length of queue is {}.", local_req_queue.len());
             notify_chan.send(()); // Send incoming notification to responder task. 
         }
@@ -300,10 +325,11 @@ impl WebServer {
         // Receiver<> cannot be sent to another task. So we have to make this task as the main task that can access self.notify_rx.
         let (request_tx, request_rx) = channel();
         loop {
-            self.notify_rx.recv();    // waiting for new request enqueued.
+            self.notify_rx.recv();    // waiting for new request enqueued. This is where the infinity loop locate
             {   // make sure we request the lock inside a block with different scope, so that we give it back at the end of that block
                 let mut req_queue = req_queue_get.lock().unwrap();
                 if req_queue.len() > 0 {
+                    self.thread_sema.acquire();
                     let req = req_queue.remove(0);
                     debug!("A new request dequeued, now the length of queue is {}.", req_queue.len());
                     request_tx.send(req);
@@ -326,9 +352,14 @@ impl WebServer {
                 Ok(s) => s,
                 Err(e) => panic!("There was an error while receiving from the stream channel! {}", e),
             };
-            WebServer::respond_with_static_file(stream, &request.path);
-            // Close stream automatically.
-            debug!("=====Terminated connection from [{}].=====", request.peer_name);
+            let sema=self.thread_sema.clone();
+            let cache=self.cache.clone();
+            Thread::spawn(move||{
+                WebServer::respond_with_static_file(stream, &request.path,cache);
+                debug!("finishing request for{}",request.path.display());
+                debug!("=====Terminated connection from [{}].=====", request.peer_name);
+                sema.release();
+            });
         }
     }
     
