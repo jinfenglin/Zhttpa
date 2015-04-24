@@ -85,7 +85,7 @@ struct WebServer {
     stream_map_arc: Arc<Mutex<HashMap<String, std::old_io::net::tcp::TcpStream>>>,//it is a hash map,store the http stream for each ip
     visitor_count : Arc<Mutex<usize>>,
     thread_sema : Arc<Semaphore>,
-    cache: Arc<Mutex<HashMap<Path,String>>>,
+    cache: Arc<Mutex<HashMap<Path,(String,usize)>>>,
 
     
     notify_rx: Receiver<()>,
@@ -213,24 +213,29 @@ impl WebServer {
       stream.write(response.as_bytes());
     }
     
+
     // TODO: Streaming file.
     // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<Mutex<HashMap<Path,String>>>) {
+    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<Mutex<HashMap<Path,(String,usize)>>>) {
         let mut stream = stream;
         
         let mut cache_str=String::new();
+        let mut counter=0;
         let mut local_cache=cache.lock().unwrap();
         //if the file is modified, remove the cache
+        
 
-        let content= match local_cache.get(path){
-            Some(f) => 
-            {
-                debug!("Reading cached file:{}",path.display());
-                let _ = stream.write_all(f.as_bytes());
-                false
-            },
-            None    => {
-                debug!("reading from disk!");
+        //update the counter 
+        for (key,value) in local_cache.iter_mut(){
+            value.1+=1;
+        }
+        if local_cache.contains_key(path){
+            debug!("Reading cached file:{}",path.display());
+            let pair=local_cache.get(path).unwrap();
+            let _ = stream.write(pair.0.as_bytes());
+        }
+        else{
+            debug!("reading from disk!");
                 let file_reader = File::open(path).unwrap();
                 stream.write(HTTP_OK.as_bytes());
                 let mut reader = BufferedReader::new(file_reader);
@@ -238,16 +243,21 @@ impl WebServer {
                     let _ = stream.write_all(line.as_bytes());
                     cache_str.push_str(line.as_slice());
                 }
-                true
-            }};
-        if content{//this could not be written in the match block
-            let mut local_cache=cache.lock().unwrap();
-            if local_cache.len()<10{
-                local_cache.insert(path.clone(),cache_str);
-            }
+                local_cache.insert(path.clone(),(cache_str,0));
+                let cp_local_cache= local_cache.clone();
+                if cp_local_cache.len()>1{
+                    let mut max_num=0;
+                    let mut to_be_replaced : &Path=&Path::new("./");
+                    for (key,value) in cp_local_cache.iter(){
+                        if value.1>max_num{
+                            max_num=value.1;
+                            to_be_replaced=key;
+                        }
+                    }
+                    debug!("least recently used is:{}",to_be_replaced.display());
+                    local_cache.remove(to_be_replaced);
+                }
         }
-
-
     }
     
     // TODO: Server-side gashing.
@@ -324,10 +334,7 @@ impl WebServer {
             //REORDER the queue in order of the request size
             local_req_queue.push(req);
             local_req_queue.sort_by(|a, b| WebServer::get_file_size(&a.path).cmp(&WebServer::get_file_size(&b.path)));
-            /*for request in local_req_queue.iter(){
-                println!("current req order:{}",request.path.display());
-            }*/
-            
+                        
             debug!("A new request enqueued, now the length of queue is {}.", local_req_queue.len());
             notify_chan.send(()); // Send incoming notification to responder task. 
         }
