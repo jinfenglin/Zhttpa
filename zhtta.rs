@@ -217,22 +217,37 @@ impl WebServer {
     // TODO: Application-layer file caching.
     fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<Mutex<HashMap<Path,String>>>) {
         let mut stream = stream;
-        let content= match cache.lock().unwrap().get(path){
+        
+        let mut cache_str=String::new();
+        let mut local_cache=cache.lock().unwrap();
+        //if the file is modified, remove the cache
+
+        let content= match local_cache.get(path){
             Some(f) => 
             {
                 debug!("Reading cached file:{}",path.display());
                 let _ = stream.write_all(f.as_bytes());
+                false
             },
             None    => {
                 debug!("reading from disk!");
                 let file_reader = File::open(path).unwrap();
                 stream.write(HTTP_OK.as_bytes());
                 let mut reader = BufferedReader::new(file_reader);
-                //cache.lock().unwrap().insert(path.clone(),String::new());
                 for line in reader.lines().filter_map(|result| result.ok()) {
                     let _ = stream.write_all(line.as_bytes());
+                    cache_str.push_str(line.as_slice());
                 }
-            }};            
+                true
+            }};
+        if content{//this could not be written in the match block
+            let mut local_cache=cache.lock().unwrap();
+            if local_cache.len()<10{
+                local_cache.insert(path.clone(),cache_str);
+            }
+        }
+
+
     }
     
     // TODO: Server-side gashing.
