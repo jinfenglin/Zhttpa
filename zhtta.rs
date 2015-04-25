@@ -31,7 +31,6 @@ extern crate libc;
 
 use std::io::*;
 use std::old_io::File;
-use std::sync::Semaphore;
 use std::{os, str};
 use std::process::{Command, Stdio};
 use std::old_path::posix::Path;
@@ -44,8 +43,8 @@ use std::old_io::BufferedReader;
 
 extern crate getopts;
 use getopts::{optopt, getopts};
-
-use std::sync::{Arc, Mutex};
+use std::sync::RwLock;
+use std::sync::{Arc, Mutex,Semaphore};
 use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc::channel;
 
@@ -85,7 +84,8 @@ struct WebServer {
     stream_map_arc: Arc<Mutex<HashMap<String, std::old_io::net::tcp::TcpStream>>>,//it is a hash map,store the http stream for each ip
     visitor_count : Arc<Mutex<usize>>,
     thread_sema : Arc<Semaphore>,
-    cache: Arc<Mutex<HashMap<Path,(String,usize)>>>,
+    cache: Arc<RwLock<HashMap<Path,(String,Mutex<usize>)>>>,
+    cache_len: Arc<Mutex<usize>>,
 
     
     notify_rx: Receiver<()>,
@@ -107,7 +107,8 @@ impl WebServer {
             stream_map_arc: Arc::new(Mutex::new(HashMap::new())),
             visitor_count:Arc::new(Mutex::new(0)),
             thread_sema: Arc::new(Semaphore::new(5)),
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_len: Arc::new(Mutex::new(0)),
             
             notify_rx: notify_rx,
             notify_tx: notify_tx,
@@ -126,6 +127,7 @@ impl WebServer {
         let notify_tx = self.notify_tx.clone();
         let stream_map_arc = self.stream_map_arc.clone();
         let visitor_count=self.visitor_count.clone();
+        
         Thread::spawn(move|| {
         	let listener = std::old_io::TcpListener::bind(addr.as_slice()).unwrap();
             let mut acceptor = listener.listen().unwrap();
@@ -216,30 +218,36 @@ impl WebServer {
 
     // TODO: Streaming file.
     // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<Mutex<HashMap<Path,(String,usize)>>>) {
+    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<RwLock<HashMap<Path,(String,Mutex<usize>)>>>,cache_len :Arc<Mutex<usize>>) {
         let mut stream = stream;
-        
         let mut cache_str=String::new();
         let mut counter=0;
-        debug!("waiting for caching mutex");
-        let mut local_cache=cache.lock().unwrap();
-        //if the file is modified, remove the cache
         
-
-        //update the counter 
-        for (key,value) in local_cache.iter_mut(){
-            value.1+=1;
-        }
-        if local_cache.contains_key(path){
-            debug!("Reading cached file:{}",path.display());
-            let mut pair=local_cache.get_mut(path).unwrap();
-            pair.1=0;
-            //String::form_str("hello");
-            stream.write(HTTP_OK.as_bytes());
-            let _ = stream.write_all(pair.0.as_bytes());
-        }
-        else{
-            debug!("reading from disk!");
+        
+        let mut local_cache=cache.clone();
+        //if the file is modified, remove the cache
+        {
+            //update the counter
+            debug!("updating counter...");
+            let read_hash=local_cache.read().unwrap();
+            for (key,value) in read_hash.iter(){
+                let mut counter=value.1.lock().unwrap();
+                *counter+=1;
+            }
+            if read_hash.contains_key(path){
+                debug!("Reading cached file:{}",path.display());
+                let mut pair=read_hash.get(path).unwrap();
+                {
+                    //drop mutex as soon as it is done to allow more currency
+                    *pair.1.lock().unwrap()=0;
+                }
+                //String::form_str("hello");
+                stream.write(HTTP_OK.as_bytes());
+                let _ = stream.write_all(pair.0.as_bytes());
+                return;
+            }
+            else{
+                debug!("reading from disk!");
                 let file_reader = File::open(path).unwrap();
                 stream.write(HTTP_OK.as_bytes());
                 let mut reader = BufferedReader::new(file_reader);
@@ -247,21 +255,41 @@ impl WebServer {
                     let _ = stream.write_all(line.as_bytes());
                     cache_str.push_str(line.as_slice());
                 }
-                local_cache.insert(path.clone(),(cache_str,0));
-                let cp_local_cache= local_cache.clone();
-                if cp_local_cache.len()>2{
-                    let mut max_num=0;
-                    let mut to_be_replaced : &Path=&Path::new("./");
-                    for (key,value) in cp_local_cache.iter(){
-                        if value.1>max_num{
-                            max_num=value.1;
-                            to_be_replaced=key;
-                        }
-                    }
-                    debug!("least recently used is:{}",to_be_replaced.display());
-                    local_cache.remove(to_be_replaced);
-                }
+
+            }
         }
+        debug!("updating cache....");
+        {
+            let mut write_hash=local_cache.write().unwrap();
+            write_hash.insert(path.clone(),(cache_str,Mutex::new(0)));
+        }
+        let mut to_be_replaced : Path=Path::new("./");
+        *cache_len.lock().unwrap()+=1;
+        {
+            if *cache_len.lock().unwrap()>2{
+                let mut max_num=0;
+                //let mut to_be_replaced : &Path=&Path::new("./");
+                let read_hash=local_cache.read().unwrap();
+                let mut tmp: &Path=&Path::new("./");
+                for (key,value) in read_hash.iter(){
+                    let num=*value.1.lock().unwrap();
+                    if num>max_num{
+                        max_num=num;
+                        tmp=key;
+                    }
+                }
+                to_be_replaced=tmp.clone();
+            }else{
+                return
+            }
+        }
+        debug!("least recently used is:{}",to_be_replaced.display());
+        {
+            let mut write_hash=local_cache.write().unwrap();
+            write_hash.remove(&to_be_replaced);
+        }
+        
+
     }
     
     // TODO: Server-side gashing.
@@ -379,10 +407,11 @@ impl WebServer {
                 Err(e) => panic!("There was an error while receiving from the stream channel! {}", e),
             };
             let sema=self.thread_sema.clone();
-            let cache=self.cache.clone();
+            let cache_len=self.cache_len.clone();
+            let mut cache=self.cache.clone();
             Thread::spawn(move||{
                 debug!("Processing....");
-                WebServer::respond_with_static_file(stream, &request.path,cache);
+                WebServer::respond_with_static_file(stream, &request.path,cache,cache_len);
                 debug!("finishing request for{}",request.path.display());
                 debug!("=====Terminated connection from [{}].=====", request.peer_name);
                 sema.release();
