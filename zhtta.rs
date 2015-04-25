@@ -49,7 +49,8 @@ use std::sync::mpsc::{Sender, Receiver};
 use std::sync::mpsc::channel;
 
 static SERVER_NAME : &'static str = "Zhtta Version 1.0";
-
+static CacheLowerBounder :u64 =1024;//1K
+static CacheUpperBounder :u64 =104857600; //100M
 static IP : &'static str = "127.0.0.1";
 static PORT : usize = 4414;
 static WWW_DIR : &'static str = "./www";
@@ -84,7 +85,7 @@ struct WebServer {
     stream_map_arc: Arc<Mutex<HashMap<String, std::old_io::net::tcp::TcpStream>>>,//it is a hash map,store the http stream for each ip
     visitor_count : Arc<Mutex<usize>>,
     thread_sema : Arc<Semaphore>,
-    cache: Arc<RwLock<HashMap<Path,(String,Mutex<usize>)>>>,
+    cache: Arc<RwLock<HashMap<Path,(String,Mutex<usize>,u64)>>>,//cache content, counter for LRU, modified time
     cache_len: Arc<Mutex<usize>>,
 
     
@@ -218,16 +219,35 @@ impl WebServer {
 
     // TODO: Streaming file.
     // TODO: Application-layer file caching.
-    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<RwLock<HashMap<Path,(String,Mutex<usize>)>>>,cache_len :Arc<Mutex<usize>>) {
+    fn respond_with_static_file(stream: std::old_io::net::tcp::TcpStream, path: &Path,cache : Arc<RwLock<HashMap<Path,(String,Mutex<usize>,u64)>>>,cache_len :Arc<Mutex<usize>>) {
         let mut stream = stream;
         let mut cache_str=String::new();
         let mut counter=0;
-        
-        
+
+
         let mut local_cache=cache.clone();
-        //if the file is modified, remove the cache
+        let mut is_modified=false;
         {
-            //update the counter
+            let metadata=std::fs::metadata(path).unwrap();
+            let modify_time=metadata.modified();
+            let read_hash=local_cache.read().unwrap();
+            if read_hash.contains_key(path)
+            {
+                let tuple=read_hash.get(path).unwrap();
+                let time = tuple.2;
+                is_modified= (time !=modify_time);
+            }
+        }
+        if is_modified{
+            debug!("It is modified, delete from cache!");
+            let mut write_hash=local_cache.write().unwrap();
+            write_hash.remove(path);
+
+
+        }
+      
+        //let mut local_cache=cache.clone();
+        {
             debug!("updating counter...");
             let read_hash=local_cache.read().unwrap();
             for (key,value) in read_hash.iter(){
@@ -238,10 +258,8 @@ impl WebServer {
                 debug!("Reading cached file:{}",path.display());
                 let mut pair=read_hash.get(path).unwrap();
                 {
-                    //drop mutex as soon as it is done to allow more currency
                     *pair.1.lock().unwrap()=0;
                 }
-                //String::form_str("hello");
                 stream.write(HTTP_OK.as_bytes());
                 let _ = stream.write_all(pair.0.as_bytes());
                 return;
@@ -255,20 +273,30 @@ impl WebServer {
                     let _ = stream.write_all(line.as_bytes());
                     cache_str.push_str(line.as_slice());
                 }
-
             }
         }
+        let file_size=std::fs::metadata(path).unwrap().len();
+        if(file_size<CacheLowerBounder){
+            debug!("file size:{}, don't cache this file(too small)",file_size);
+            return;
+        }
+        else if (file_size>CacheUpperBounder){
+            debug!("file size:{}, don't cache this file(too large)",file_size);
+            return;
+        }
+
         debug!("updating cache....");
         {
             let mut write_hash=local_cache.write().unwrap();
-            write_hash.insert(path.clone(),(cache_str,Mutex::new(0)));
+            let time=std::fs::metadata(path).unwrap().modified();
+            write_hash.insert(path.clone(),(cache_str,Mutex::new(0),time));
         }
-        let mut to_be_replaced : Path=Path::new("./");
+        
         *cache_len.lock().unwrap()+=1;
         {
+            let mut to_be_replaced : Path=Path::new("./");
             if *cache_len.lock().unwrap()>2{
                 let mut max_num=0;
-                //let mut to_be_replaced : &Path=&Path::new("./");
                 let read_hash=local_cache.read().unwrap();
                 let mut tmp: &Path=&Path::new("./");
                 for (key,value) in read_hash.iter(){
@@ -279,17 +307,13 @@ impl WebServer {
                     }
                 }
                 to_be_replaced=tmp.clone();
-            }else{
-                return
+            }
+            debug!("least recently used is:{}",to_be_replaced.display());
+            {
+                let mut write_hash=local_cache.write().unwrap();
+                write_hash.remove(&to_be_replaced);
             }
         }
-        debug!("least recently used is:{}",to_be_replaced.display());
-        {
-            let mut write_hash=local_cache.write().unwrap();
-            write_hash.remove(&to_be_replaced);
-        }
-        
-
     }
     
     // TODO: Server-side gashing.
